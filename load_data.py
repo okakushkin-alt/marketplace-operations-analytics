@@ -1,21 +1,19 @@
 
-import csv
 import os
 from pathlib import Path
 
-import psycopg2
-from psycopg2 import sql
+import pandas as pd
 from dotenv import load_dotenv
+from sqlalchemy import URL, create_engine, text
 
 
-# Загружаем настройки из .env
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "raw"
 
 load_dotenv(BASE_DIR / ".env")
 
 
-# Соответствие CSV-файлов таблицам PostgreSQL
+# CSV-файл -> таблица PostgreSQL
 FILES = {
     "olist_customers_dataset.csv": "customers",
     "olist_order_items_dataset.csv": "order_items",
@@ -27,189 +25,68 @@ FILES = {
     "product_category_name_translation.csv": "category_translation",
 }
 
-
-# Исправляем известную опечатку в названиях столбцов.
-# Например, lenght -> length.
+# Исправляем опечатки в названиях столбцов CSV.
 COLUMN_ALIASES = {
     "product_name_lenght": "product_name_length",
     "product_description_lenght": "product_description_length",
 }
 
 
-def get_csv_header(path: Path) -> list[str]:
-    """Читаем заголовок CSV с учётом возможного BOM."""
-    with path.open("r", encoding="utf-8-sig", newline="") as file:
-        reader = csv.reader(file)
-        header = next(reader, None)
-
-    if not header:
-        raise ValueError(f"CSV пустой или не содержит заголовок: {path}")
-
-    return [column.strip() for column in header]
-
-
-def get_db_columns(cursor, table: str) -> list[str]:
-    """Получаем названия столбцов целевой таблицы."""
-    cursor.execute(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'raw'
-          AND table_name = %s
-        ORDER BY ordinal_position;
-        """,
-        (table,),
+def main():
+    database_url = URL.create(
+        drivername="postgresql+psycopg2",
+        username=os.getenv("PGUSER"),
+        password=os.getenv("PGPASSWORD"),
+        host=os.getenv("PGHOST", "localhost"),
+        port=int(os.getenv("PGPORT", "5432")),
+        database=os.getenv("PGDATABASE"),
     )
 
-    return [row[0] for row in cursor.fetchall()]
-
-
-def main() -> None:
-    # Проверяем наличие всех файлов до подключения к базе.
-    missing_files = [
-        filename
-        for filename in FILES
-        if not (DATA_DIR / filename).is_file()
-    ]
-
-    if missing_files:
-        raise FileNotFoundError(
-            "Не найдены CSV-файлы:\n"
-            + "\n".join(missing_files)
-        )
-
-    # Проверяем настройки подключения.
-    required_vars = (
-        "PGHOST",
-        "PGPORT",
-        "PGDATABASE",
-        "PGUSER",
-        "PGPASSWORD",
-    )
-
-    missing_vars = [
-        name for name in required_vars if not os.getenv(name)
-    ]
-
-    if missing_vars:
-        raise ValueError(
-            "Не заданы переменные в .env: "
-            + ", ".join(missing_vars)
-        )
-
+    engine = create_engine(database_url)
     total_rows = 0
 
-    # При ошибке контекст соединения откатит транзакцию.
-    with psycopg2.connect(
-        host=os.getenv("PGHOST"),
-        port=int(os.getenv("PGPORT")),
-        dbname=os.getenv("PGDATABASE"),
-        user=os.getenv("PGUSER"),
-        password=os.getenv("PGPASSWORD"),
-    ) as conn:
-
-        with conn.cursor() as cur:
+    try:
+        # Все таблицы загружаются в рамках одной транзакции.
+        with engine.begin() as connection:
             for filename, table in FILES.items():
                 path = DATA_DIR / filename
 
                 print(f"\nЗагружаем {filename}...")
 
-                # 1. Читаем заголовок CSV.
-                header = get_csv_header(path)
+                # Читаем один CSV в DataFrame.
+                df = pd.read_csv(path, encoding="utf-8-sig")
 
-                # 2. Получаем схему таблицы.
-                db_columns = get_db_columns(cur, table)
+                # Приводим названия столбцов к схеме PostgreSQL.
+                df.rename(columns=COLUMN_ALIASES, inplace=True)
 
-                if not db_columns:
-                    raise ValueError(
-                        f"Таблица raw.{table} не найдена "
-                        "или в ней нет столбцов."
-                    )
-
-                # 3. Приводим известные опечатки к правильным именам.
-                copy_columns = [
-                    COLUMN_ALIASES.get(column, column)
-                    for column in header
-                ]
-
-                # 4. Проверяем, что столбцы CSV соответствуют таблице.
-                if len(copy_columns) != len(set(copy_columns)):
-                    raise ValueError(
-                        f"После исправления названий в {filename} "
-                        "появились повторяющиеся столбцы."
-                    )
-
-                missing_columns = set(copy_columns) - set(db_columns)
-                extra_columns = set(db_columns) - set(copy_columns)
-
-                if missing_columns or extra_columns:
-                    print("Столбцы CSV после нормализации:")
-                    print(copy_columns)
-
-                    print("Столбцы PostgreSQL:")
-                    print(db_columns)
-
-                    raise ValueError(
-                        f"Структура CSV не совпадает с raw.{table}.\n"
-                        f"Нет в таблице: {sorted(missing_columns)}\n"
-                        f"Нет в CSV: {sorted(extra_columns)}"
-                    )
-
-                # 5. Готовим COPY с явным списком столбцов.
-                # Это позволяет не зависеть от порядка столбцов
-                # в таблице PostgreSQL.
-                copy_query = sql.SQL(
-                    """
-                    COPY {}.{} ({})
-                    FROM STDIN
-                    WITH (FORMAT CSV, HEADER TRUE, NULL '')
-                    """
-                ).format(
-                    sql.Identifier("raw"),
-                    sql.Identifier(table),
-                    sql.SQL(", ").join(
-                        sql.Identifier(column)
-                        for column in copy_columns
-                    ),
+                # Очищаем старые данные перед повторной загрузкой.
+                connection.execute(
+                    text(f"TRUNCATE TABLE raw.{table}")
                 )
 
-                # 6. Очищаем таблицу только после проверки схемы.
-                cur.execute(
-                    sql.SQL("TRUNCATE TABLE {}.{}").format(
-                        sql.Identifier("raw"),
-                        sql.Identifier(table),
-                    )
+                # Загружаем данные пакетами по 2000 строк.
+                df.to_sql(
+                    name=table,
+                    con=connection,
+                    schema="raw",
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                    chunksize=2000,
                 )
 
-                # 7. Загружаем CSV.
-                with path.open(
-                    "r",
-                    encoding="utf-8-sig",
-                    newline="",
-                ) as csv_file:
-                    cur.copy_expert(
-                        copy_query.as_string(conn),
-                        csv_file,
-                    )
+                rows = len(df)
+                total_rows += rows
 
-                # 8. Проверяем количество загруженных строк.
-                cur.execute(
-                    sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
-                        sql.Identifier("raw"),
-                        sql.Identifier(table),
-                    )
-                )
+                print(f"Загружено строк: {rows:,}")
 
-                count = cur.fetchone()[0]
-                total_rows += count
+                del df
 
-                print(f"Загружено строк: {count:,}")
+        print("\nЗагрузка завершена успешно!")
+        print(f"Всего загружено строк: {total_rows:,}")
 
-        # Соединение подтвердит транзакцию при успешном выходе.
-        # При ошибке изменения будут отменены.
-
-    print("\nЗагрузка завершена успешно!")
-    print(f"Всего загружено строк: {total_rows:,}")
+    finally:
+        engine.dispose()
 
 
 if __name__ == "__main__":
