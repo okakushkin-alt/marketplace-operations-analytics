@@ -73,7 +73,10 @@ petproject/
 ├── sql/
 │   ├── 01_schema.sql
 │   ├── 02_data_quality.sql
-│   └── 03_basic_analysis.sql
+│   ├── 03_basic_analysis.sql
+│   ├── 04_delivery_analysis.sql
+│   ├── 05_delivery_reviews.sql
+│   └── 06_delivery_views.sql
 ├── check_data.py
 ├── check_summary.py
 ├── load_data.py
